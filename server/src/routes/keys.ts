@@ -10,7 +10,7 @@ import { parseKeysFromFile, stripJsoncComments, stripTrailingCommas } from '../l
 import { assessProviderUrl } from '../lib/url-guard.js';
 import { ensureModelInProfiles } from '../services/profile-models.js';
 import { getActiveCooldownsForKeys, clearCooldownsForKey } from '../services/ratelimit.js';
-import { resolveCustomEndpointKey, customEndpointKeyIds, siblingEndpointKeyId } from '../services/custom-endpoint.js';
+import { resolveCustomEndpointKey, customEndpointKeyIds, customEndpointIdForKey, siblingEndpointKeyId } from '../services/custom-endpoint.js';
 import { customModelSeed } from '../services/custom-model-seed.js';
 import { discoverEndpointModels, ModelDiscoveryError } from '../services/model-discovery.js';
 
@@ -701,6 +701,8 @@ keysRouter.post('/custom', async (req: Request, res: Response) => {
       db, baseUrl, providedKey, label, endpoint.keyId ?? undefined,
     );
     const endpointKeyIds = customEndpointKeyIds(db, keyId);
+    const customEndpointId = customEndpointIdForKey(db, keyId);
+    if (customEndpointId == null) throw new Error('Custom endpoint identity is unavailable for this key');
     // Unknown ≠ worst: seed the routing ranks at the catalog median so a new
     // custom model is explored instead of buried at intelligence 0 (#488).
     const seed = customModelSeed(db);
@@ -716,8 +718,8 @@ keysRouter.post('/custom', async (req: Request, res: Response) => {
       // Capability flags: an unset flag binds NULL so COALESCE picks the insert
       // default (tools 1, vision 0) on a new row and preserves the existing
       // value on re-registration. (#470)
-      const bound = db.prepare("SELECT key_id FROM models WHERE platform = 'custom' AND model_id = ?")
-        .get(modelId) as { key_id: number | null } | undefined;
+      const bound = db.prepare("SELECT key_id FROM models WHERE platform = 'custom' AND custom_endpoint_id = ? AND model_id = ?")
+        .get(customEndpointId, modelId) as { key_id: number | null } | undefined;
       const created = bound === undefined;
       const bindKeyId = bound?.key_id != null && endpointKeyIds.has(bound.key_id) ? bound.key_id : keyId;
       const toolsParam = supportsTools === undefined ? null : (supportsTools ? 1 : 0);
@@ -729,23 +731,22 @@ keysRouter.post('/custom', async (req: Request, res: Response) => {
         INSERT INTO models
           (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
            rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, key_id,
-           supports_tools, supports_vision, source)
+           supports_tools, supports_vision, source, custom_endpoint_id)
         VALUES ('custom', @modelId, @displayName, @intelligenceRank, @speedRank, @sizeLabel,
            NULL, NULL, NULL, NULL, '', NULL, 1, @keyId,
-           COALESCE(@tools, 1), COALESCE(@vision, 0), 'user')
-        ON CONFLICT(platform, model_id)
-        DO UPDATE SET
+           COALESCE(@tools, 1), COALESCE(@vision, 0), 'user', @customEndpointId)
+        ON CONFLICT DO UPDATE SET
           display_name = excluded.display_name,
           key_id = excluded.key_id,
           enabled = 1,
           supports_tools = COALESCE(@tools, supports_tools),
           supports_vision = COALESCE(@vision, supports_vision)
       `).run({
-        modelId, displayName, keyId: bindKeyId, tools: toolsParam, vision: visionParam,
+        modelId, displayName, keyId: bindKeyId, customEndpointId, tools: toolsParam, vision: visionParam,
         intelligenceRank: seed.intelligenceRank, speedRank: seed.speedRank, sizeLabel: seed.sizeLabel,
       });
 
-      const modelRow = db.prepare("SELECT id, supports_tools, supports_vision FROM models WHERE platform = 'custom' AND model_id = ?").get(modelId) as { id: number; supports_tools: number; supports_vision: number };
+      const modelRow = db.prepare("SELECT id, supports_tools, supports_vision FROM models WHERE platform = 'custom' AND custom_endpoint_id = ? AND model_id = ?").get(customEndpointId, modelId) as { id: number; supports_tools: number; supports_vision: number };
 
       // Append to the fallback chain if not already present.
       const inChain = db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelRow.id);
@@ -952,7 +953,7 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const row = db.prepare('SELECT platform, base_url FROM api_keys WHERE id = ?').get(id) as { platform: string; base_url: string | null } | undefined;
+  const row = db.prepare('SELECT platform, base_url, custom_endpoint_id FROM api_keys WHERE id = ?').get(id) as { platform: string; base_url: string | null; custom_endpoint_id: number | null } | undefined;
   if (!row) {
     res.status(404).json({ error: { message: 'Key not found' } });
     return;
@@ -963,7 +964,11 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
 
   const remove = db.transaction(() => {
     if (sibling != null) {
+      if (row.platform === 'custom' && row.custom_endpoint_id != null) {
+        db.prepare("UPDATE models SET key_id = ? WHERE platform = 'custom' AND custom_endpoint_id = ?").run(sibling, row.custom_endpoint_id);
+      }
       for (const table of ['models', 'embedding_models', 'media_models']) {
+        if (table === 'models' && row.platform === 'custom' && row.custom_endpoint_id != null) continue;
         db.prepare(`UPDATE ${table} SET key_id = ? WHERE platform = 'custom' AND key_id = ?`).run(sibling, id);
       }
       db.prepare('DELETE FROM api_keys WHERE id = ?').run(id);
@@ -978,8 +983,14 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
     // so they never linger in the fallback chain forever (#189).
     if (row.platform === 'custom') {
       const defaultEmbedding = db.prepare("SELECT value FROM settings WHERE key = 'embeddings_default_family'").get() as { value: string } | undefined;
-      db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom' AND key_id = ?)").run(id);
-      db.prepare("DELETE FROM models WHERE platform = 'custom' AND key_id = ?").run(id);
+      if (row.custom_endpoint_id != null) {
+        db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom' AND custom_endpoint_id = ?)").run(row.custom_endpoint_id);
+        db.prepare("DELETE FROM models WHERE platform = 'custom' AND custom_endpoint_id = ?").run(row.custom_endpoint_id);
+        db.prepare('DELETE FROM custom_endpoints WHERE id = ?').run(row.custom_endpoint_id);
+      } else {
+        db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom' AND key_id = ?)").run(id);
+        db.prepare("DELETE FROM models WHERE platform = 'custom' AND key_id = ?").run(id);
+      }
       db.prepare("DELETE FROM embedding_models WHERE platform = 'custom' AND key_id = ?").run(id);
       db.prepare("DELETE FROM media_models WHERE platform = 'custom' AND key_id = ?").run(id);
       const remaining = db.prepare("SELECT COUNT(*) AS n FROM api_keys WHERE platform = 'custom'").get() as { n: number };

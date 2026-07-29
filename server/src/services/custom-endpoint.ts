@@ -7,9 +7,9 @@ import type { Db } from '../db/types.js';
 // pooling them is the whole point of adding more than one (#619). Registration
 // therefore matches on (base_url, secret), never on base_url alone: a new
 // secret for a known endpoint INSERTs, it does not overwrite the key already
-// stored. Models still bind to one api_keys row via key_id (#212); the router
-// treats every key sharing that row's base_url as an alternative for the same
-// model, so the binding names the ENDPOINT and the pool rotates underneath it.
+// stored. Models bind to the stable custom_endpoints row; key_id is retained as
+// the pool's preferred credential, while the router can rotate within that
+// endpoint's credentials.
 
 // Stored for endpoints that need no credential (llama.cpp / LM Studio / vLLM
 // with auth off). It is a placeholder, not a secret, so a real key may replace
@@ -21,6 +21,17 @@ interface StoredKeyRow {
   encrypted_key: string;
   iv: string;
   auth_tag: string;
+}
+
+function endpointIdForBaseUrl(db: Db, baseUrl: string): number {
+  db.prepare('INSERT OR IGNORE INTO custom_endpoints (base_url) VALUES (?)').run(baseUrl);
+  return (db.prepare('SELECT id FROM custom_endpoints WHERE base_url = ?').get(baseUrl) as { id: number }).id;
+}
+
+export function customEndpointIdForKey(db: Db, keyId: number): number | null {
+  const row = db.prepare('SELECT custom_endpoint_id FROM api_keys WHERE id = ? AND platform = \'custom\'').get(keyId) as
+    { custom_endpoint_id: number | null } | undefined;
+  return row?.custom_endpoint_id ?? null;
 }
 
 export interface ResolvedEndpointKey {
@@ -55,10 +66,11 @@ function touch(db: Db, id: number, label: string | undefined): void {
 
 function insertKey(db: Db, baseUrl: string, secret: string, label: string | undefined): ResolvedEndpointKey {
   const { encrypted, iv, authTag } = encrypt(secret);
+  const endpointId = endpointIdForBaseUrl(db, baseUrl);
   const r = db.prepare(`
-    INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, base_url)
-    VALUES ('custom', ?, ?, ?, ?, 'unknown', 1, ?)
-  `).run(label ?? 'Custom', encrypted, iv, authTag, baseUrl);
+    INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, base_url, custom_endpoint_id)
+    VALUES ('custom', ?, ?, ?, ?, 'unknown', 1, ?, ?)
+  `).run(label ?? 'Custom', encrypted, iv, authTag, baseUrl, endpointId);
   return { keyId: Number(r.lastInsertRowid), storedKey: secret, created: true };
 }
 
@@ -125,11 +137,11 @@ export function resolveCustomEndpointKey(
  * key itself when the row is gone or carries no base_url.
  */
 export function customEndpointKeyIds(db: Db, keyId: number): Set<number> {
-  const row = db.prepare("SELECT base_url FROM api_keys WHERE id = ?").get(keyId) as
-    { base_url: string | null } | undefined;
-  if (!row?.base_url) return new Set([keyId]);
-  const siblings = db.prepare("SELECT id FROM api_keys WHERE platform = 'custom' AND base_url = ?")
-    .all(row.base_url) as { id: number }[];
+  const row = db.prepare('SELECT custom_endpoint_id FROM api_keys WHERE id = ?').get(keyId) as
+    { custom_endpoint_id: number | null } | undefined;
+  if (row?.custom_endpoint_id == null) return new Set([keyId]);
+  const siblings = db.prepare("SELECT id FROM api_keys WHERE platform = 'custom' AND custom_endpoint_id = ?")
+    .all(row.custom_endpoint_id) as { id: number }[];
   return new Set(siblings.map(s => s.id));
 }
 
@@ -139,6 +151,15 @@ export function customEndpointKeyIds(db: Db, keyId: number): Set<number> {
  * them with the key.
  */
 export function siblingEndpointKeyId(db: Db, keyId: number, baseUrl: string | null): number | null {
+  const endpoint = customEndpointIdForKey(db, keyId);
+  if (endpoint != null) {
+    const sibling = db.prepare(`
+      SELECT id FROM api_keys
+       WHERE platform = 'custom' AND custom_endpoint_id = ? AND id != ?
+       ORDER BY id LIMIT 1
+    `).get(endpoint, keyId) as { id: number } | undefined;
+    return sibling?.id ?? null;
+  }
   if (!baseUrl) return null;
   const row = db.prepare(`
     SELECT id FROM api_keys

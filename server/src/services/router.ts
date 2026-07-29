@@ -369,7 +369,7 @@ interface KeyStats {
 }
 
 let statsCache: Map<string, ModelStats> | null = null;
-let keyStatsCache: Map<string, KeyStats> | null = null; // "platform:model_id:key_id"
+let keyStatsCache: Map<string, KeyStats> | null = null; // "model_db_id:key_id"
 let statsCacheTime = 0;
 
 function decayWeight(ageDays: number): number {
@@ -395,7 +395,15 @@ export function refreshStatsCache(db: Db, force = false): void {
   // 60s-cached shape. Aggregated two ways below: rolled up per model (ordering)
   // and per key (in-model key selection, #580).
   const buckets = db.prepare(`
-    SELECT platform, model_id, key_id,
+    WITH matched_requests AS (
+      SELECT r.*,
+        COALESCE(r.model_db_id, CASE WHEN r.platform != 'custom' THEN (
+          SELECT m.id FROM models m WHERE m.platform = r.platform AND m.model_id = r.model_id
+        ) END) AS resolved_model_db_id
+      FROM requests r WHERE r.created_at >= ?
+    )
+    SELECT resolved_model_db_id AS model_db_id,
+           key_id,
       CAST((julianday('now') - julianday(created_at)) AS INTEGER) AS age_days,
       COUNT(*) AS total,
       SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes,
@@ -405,11 +413,11 @@ export function refreshStatsCache(db: Db, force = false): void {
       SUM(CASE WHEN status = 'success' AND ttfb_ms IS NOT NULL THEN 1 ELSE 0 END) AS succ_ttfb_cnt,
       SUM(CASE WHEN ${IS_TIMEOUT_SQL} THEN 1 ELSE 0 END) AS timeouts,
       SUM(CASE WHEN ${IS_TIMEOUT_SQL} THEN MIN(MAX(latency_ms, 0), ${TIMEOUT_LATENCY_CAP_MS}) ELSE 0 END) AS timeout_lat
-    FROM requests
-    WHERE created_at >= ?
-    GROUP BY platform, model_id, key_id, age_days
+    FROM matched_requests
+    WHERE resolved_model_db_id IS NOT NULL
+    GROUP BY resolved_model_db_id, key_id, age_days
   `).all(since) as Array<{
-    platform: string; model_id: string; key_id: number | null; age_days: number; total: number; successes: number;
+    model_db_id: number; key_id: number | null; age_days: number; total: number; successes: number;
     succ_out: number; succ_lat: number; succ_ttfb_sum: number; succ_ttfb_cnt: number;
     timeouts: number; timeout_lat: number;
   }>;
@@ -437,7 +445,7 @@ export function refreshStatsCache(db: Db, force = false): void {
   const acc = new Map<string, Acc>();
   const keyAcc = new Map<string, Acc>();
   for (const b of buckets) {
-    const key = `${b.platform}:${b.model_id}`;
+    const key = String(b.model_db_id);
     const w = decayWeight(b.age_days);
     let a = acc.get(key);
     if (!a) acc.set(key, a = emptyAcc());
@@ -452,13 +460,21 @@ export function refreshStatsCache(db: Db, force = false): void {
 
   // Calendar-month token usage per model, for the headroom guardrail.
   const usageRows = db.prepare(`
-    SELECT platform, model_id, COALESCE(SUM(input_tokens + output_tokens), 0) AS used
-    FROM requests
-    WHERE created_at >= datetime('now', 'start of month')
-      AND request_type = 'chat'
-    GROUP BY platform, model_id
-  `).all() as Array<{ platform: string; model_id: string; used: number }>;
-  const usageMap = new Map(usageRows.map(r => [`${r.platform}:${r.model_id}`, r.used]));
+    WITH matched_requests AS (
+      SELECT r.*,
+        COALESCE(r.model_db_id, CASE WHEN r.platform != 'custom' THEN (
+          SELECT m.id FROM models m WHERE m.platform = r.platform AND m.model_id = r.model_id
+        ) END) AS resolved_model_db_id
+      FROM requests r
+      WHERE r.created_at >= datetime('now', 'start of month') AND r.request_type = 'chat'
+    )
+    SELECT resolved_model_db_id AS model_db_id,
+           COALESCE(SUM(input_tokens + output_tokens), 0) AS used
+    FROM matched_requests
+    WHERE resolved_model_db_id IS NOT NULL
+    GROUP BY resolved_model_db_id
+  `).all() as Array<{ model_db_id: number; used: number }>;
+  const usageMap = new Map(usageRows.map(r => [String(r.model_db_id), r.used]));
 
   const next = new Map<string, ModelStats>();
   for (const [key, a] of acc) {
@@ -551,9 +567,9 @@ export function writeObservedSpeedRanks(db: Db): number {
   let written = 0;
   const tx = db.transaction(() => {
     for (const row of rows) {
-      const key = `${row.platform}:${row.model_id}`;
-      if (pinned.has(key)) continue;
-      const stats = statsCache!.get(key);
+      const legacyKey = `${row.platform}:${row.model_id}`;
+      if (row.platform !== 'custom' && pinned.has(legacyKey)) continue;
+      const stats = statsCache!.get(String(row.id));
       if (!stats || stats.speedSamples < SPEED_RANK_MIN_SAMPLES) continue;
       const rank = observedSpeedRank(speedScore(stats.tokPerSec, stats.avgTtfbMs));
       if (rank === row.speed_rank) continue;
@@ -591,6 +607,18 @@ function usableKeyCountsByPlatform(db: Db): Map<string, number> {
   return new Map(rows.map(r => [r.platform, r.count]));
 }
 
+function usableCustomEndpointKeyCount(db: Db, keyId: number | null): number {
+  if (keyId == null) return 1;
+  const ids = customEndpointKeyIds(db, keyId);
+  if (ids.size === 0) return 1;
+  const placeholders = [...ids].map(() => '?').join(', ');
+  const row = db.prepare(`
+    SELECT COUNT(*) AS count FROM api_keys
+     WHERE id IN (${placeholders}) AND enabled = 1 AND status IN ('healthy', 'unknown')
+  `).get(...ids) as { count: number };
+  return Math.max(1, row.count);
+}
+
 function scoreChainEntry(
   entry: ChainRow,
   weights: RoutingWeights,
@@ -599,7 +627,7 @@ function scoreChainEntry(
   sampled: boolean,
   keyCounts: Map<string, number>,
 ): ScoredEntry {
-  const stats = statsCache?.get(`${entry.platform}:${entry.model_id}`);
+  const stats = statsCache?.get(String(entry.model_db_id));
   const successes = stats?.successes ?? 0;
   const failures = stats?.failures ?? 0;
 
@@ -619,7 +647,10 @@ function scoreChainEntry(
   // Scale the per-key monthly budget by the usable key count for this platform,
   // matching the pooled `monthlyUsedTokens` aggregate (#456). Math.max(1, …) so a
   // model whose platform currently has no usable key isn't handed a 0 budget.
-  const budget = parseBudget(entry.monthly_token_budget) * Math.max(1, keyCounts.get(entry.platform) ?? 1);
+  const usableKeyCount = entry.platform === 'custom'
+    ? usableCustomEndpointKeyCount(getDb(), entry.key_id)
+    : Math.max(1, keyCounts.get(entry.platform) ?? 1);
+  const budget = parseBudget(entry.monthly_token_budget) * usableKeyCount;
   const headroom = headroomFactor(stats?.monthlyUsedTokens ?? 0, budget);
   const rl = rateLimitFactor(getPenalty(entry.model_db_id));
 
@@ -832,7 +863,7 @@ const KEY_SCORE_WEIGHTS = { reliability: 0.75, speed: 0.25 };
  */
 function orderKeysByScore(entry: ChainRow, keys: KeyRow[]): KeyRow[] | null {
   if (keys.length < 2 || !keyStatsCache) return null;
-  const prefix = `${entry.platform}:${entry.model_id}:`;
+  const prefix = `${entry.model_db_id}:`;
   if (!keys.some(k => keyStatsCache!.has(prefix + k.id))) return null;
 
   return keys
@@ -894,7 +925,7 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
   // 60s-TTL aggregate the model-level bandit uses (refresh is a no-op when
   // fresh, and cheap when not). With no data at all, keep the legacy rotation.
   refreshStatsCache(db);
-  const rrKey = `${entry.platform}:${entry.model_id}`;
+  const rrKey = String(entry.model_db_id);
   let idx = roundRobinIndex.get(rrKey) ?? 0;
   const ranked = orderKeysByScore(entry, keys);
 
@@ -1386,7 +1417,7 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
 
   const scores: RoutingScore[] = chain.map(entry => {
     const scored = scoreChainEntry(entry, weights, intelMin, intelMax, false, keyCounts);
-    const stats = statsCache?.get(`${entry.platform}:${entry.model_id}`);
+    const stats = statsCache?.get(String(entry.model_db_id));
     return {
       modelDbId: entry.model_db_id,
       platform: entry.platform,

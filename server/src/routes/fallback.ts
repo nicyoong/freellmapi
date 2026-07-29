@@ -72,7 +72,7 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
            m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit,
            m.tpm_limit, m.tpd_limit, m.context_window,
            m.monthly_token_budget, m.supports_vision, m.supports_tools,
-           m.key_id, ak.label AS key_label,
+           m.key_id, m.custom_endpoint_id, ak.label AS key_label,
            mo.overrides_json IS NOT NULL AS has_overrides,
            mo.overrides_json,
            ts.source AS tombstone_source, ts.reason AS tombstone_reason
@@ -93,7 +93,7 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
            m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit,
            m.tpm_limit, m.tpd_limit, m.context_window,
            m.monthly_token_budget, m.supports_vision, m.supports_tools,
-           m.key_id, ak.label AS key_label,
+           m.key_id, m.custom_endpoint_id, ak.label AS key_label,
            mo.overrides_json IS NOT NULL AS has_overrides,
            mo.overrides_json,
            ts.source AS tombstone_source, ts.reason AS tombstone_reason
@@ -117,6 +117,10 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
     GROUP BY platform
   `).all() as { platform: string; count: number }[];
   const keyCountMap = new Map(keyCounts.map(k => [k.platform, k.count]));
+  const endpointKeyCountMap = new Map(
+    (db.prepare("SELECT custom_endpoint_id, COUNT(*) AS count FROM api_keys WHERE platform = 'custom' AND custom_endpoint_id IS NOT NULL AND enabled = 1 AND status IN ('healthy', 'unknown') GROUP BY custom_endpoint_id").all() as { custom_endpoint_id: number; count: number }[])
+      .map(k => [k.custom_endpoint_id, k.count]),
+  );
 
   // Get current dynamic penalties
   const penalties = getAllPenalties();
@@ -162,7 +166,8 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
       // Parsed once here (single source of truth) so the dashboard never re-implements
       // budget-label parsing; 0 for rate-limited/placeholder labels. See lib/budget.ts.
       // Scaled by healthy/enabled key count for multi-account pooled capacity.
-      monthlyTokenBudgetTokens: parseBudget(r.monthly_token_budget) * Math.max(1, keyCountMap.get(r.platform) ?? 1),
+      monthlyTokenBudgetTokens: parseBudget(r.monthly_token_budget) * Math.max(1,
+        r.platform === 'custom' ? (endpointKeyCountMap.get(r.custom_endpoint_id) ?? 1) : (keyCountMap.get(r.platform) ?? 1)),
       supportsVision: r.supports_vision === 1,
       supportsTools: r.supports_tools === 1,
       source: r.platform === 'custom' || r.key_id != null ? 'custom' : 'catalog',
@@ -178,7 +183,7 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
       // provider's own (redacted) wording.
       retiredUpstream: r.tombstone_source === 'upstream_eol',
       retiredReason: r.tombstone_source === 'upstream_eol' ? (r.tombstone_reason ?? null) : null,
-      keyCount: keyCountMap.get(r.platform) ?? 0,
+      keyCount: r.platform === 'custom' ? (endpointKeyCountMap.get(r.custom_endpoint_id) ?? 0) : (keyCountMap.get(r.platform) ?? 0),
     };
   }));
 });
@@ -312,12 +317,12 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
     ? db.prepare('SELECT id FROM profiles WHERE id = ?').get(activeProfileId) as any
     : null;
 
-  let rawModels: { model_db_id: number; platform: string; model_id: string; display_name: string; monthly_token_budget: string; priority: number; enabled: number; rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null }[];
+  let rawModels: { model_db_id: number; platform: string; model_id: string; display_name: string; monthly_token_budget: string; priority: number; enabled: number; rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null; custom_endpoint_id: number | null }[];
 
   if (activeProfile) {
     // Profile mode: use profile_models chain (all models in profile, checked against enabled)
     rawModels = db.prepare(`
-      SELECT m.id as model_db_id, m.platform, m.model_id, m.display_name, m.monthly_token_budget,
+      SELECT m.id as model_db_id, m.platform, m.model_id, m.display_name, m.monthly_token_budget, m.custom_endpoint_id,
              pm.priority, pm.enabled,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit
       FROM profile_models pm
@@ -328,7 +333,7 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
   } else {
     // Default mode: use fallback_config (only include enabled models)
     rawModels = db.prepare(`
-      SELECT m.id as model_db_id, m.platform, m.model_id, m.display_name, m.monthly_token_budget,
+      SELECT m.id as model_db_id, m.platform, m.model_id, m.display_name, m.monthly_token_budget, m.custom_endpoint_id,
              fc.priority, fc.enabled,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit
       FROM fallback_config fc
@@ -340,30 +345,43 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
 
   // Build per-model breakdown (only platforms with keys), preserving enabled state
   const usageRows = db.prepare(`
-    SELECT platform, model_id, COALESCE(SUM(input_tokens + output_tokens), 0) AS used
-    FROM requests
-    WHERE created_at >= datetime('now', 'start of month')
-      AND request_type = 'chat'
-    GROUP BY platform, model_id
-  `).all() as { platform: string; model_id: string; used: number }[];
-  const usageByModel = new Map(usageRows.map(r => [`${r.platform}:${r.model_id}`, r.used]));
+    WITH matched_requests AS (
+      SELECT r.*,
+        COALESCE(r.model_db_id, CASE WHEN r.platform != 'custom' THEN (
+          SELECT m.id FROM models m WHERE m.platform = r.platform AND m.model_id = r.model_id
+        ) END) AS resolved_model_db_id
+      FROM requests r
+      WHERE r.created_at >= datetime('now', 'start of month') AND r.request_type = 'chat'
+    )
+    SELECT resolved_model_db_id AS model_db_id, COALESCE(SUM(input_tokens + output_tokens), 0) AS used
+    FROM matched_requests
+    WHERE resolved_model_db_id IS NOT NULL
+    GROUP BY resolved_model_db_id
+  `).all() as { model_db_id: number; used: number }[];
+  const usageByModel = new Map(usageRows.map(r => [r.model_db_id, r.used]));
 
   const keyCountMap = new Map(
     (db.prepare("SELECT platform, COUNT(*) as count FROM api_keys WHERE enabled = 1 AND status IN ('healthy', 'unknown') GROUP BY platform").all() as { platform: string; count: number }[])
       .map(k => [k.platform, k.count])
   );
+  const endpointKeyCountMap = new Map(
+    (db.prepare("SELECT custom_endpoint_id, COUNT(*) as count FROM api_keys WHERE platform = 'custom' AND custom_endpoint_id IS NOT NULL AND enabled = 1 AND status IN ('healthy', 'unknown') GROUP BY custom_endpoint_id").all() as { custom_endpoint_id: number; count: number }[])
+      .map(k => [k.custom_endpoint_id, k.count]),
+  );
 
   const modelBudgets = rawModels
     .filter(m => platformSet.has(m.platform))
     .map(m => {
-      const keys = Math.max(1, keyCountMap.get(m.platform) ?? 1);
+      const keys = Math.max(1, m.platform === 'custom'
+        ? (endpointKeyCountMap.get(m.custom_endpoint_id ?? -1) ?? 1)
+        : (keyCountMap.get(m.platform) ?? 1));
       return {
         modelDbId: m.model_db_id,
         displayName: m.display_name,
         platform: m.platform,
         modelId: m.model_id,
         budget: parseBudget(m.monthly_token_budget) * keys,
-        used: usageByModel.get(`${m.platform}:${m.model_id}`) ?? 0,
+        used: usageByModel.get(m.model_db_id) ?? 0,
         enabled: m.enabled === 1,
         rpmLimit: m.rpm_limit,
         rpdLimit: m.rpd_limit,

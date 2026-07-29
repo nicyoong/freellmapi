@@ -28,7 +28,7 @@ function seedModel(modelId = MODEL_ID): number {
   db.prepare(`
     INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, enabled, source)
     VALUES (?, ?, 'EOL Test', 50, 50, 1, 'catalog')
-    ON CONFLICT(platform, model_id) DO UPDATE SET enabled = 1
+    ON CONFLICT DO UPDATE SET enabled = 1
   `).run(PLATFORM, modelId);
   const row = db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?')
     .get(PLATFORM, modelId) as { id: number };
@@ -157,7 +157,7 @@ describe('noteModelRetirementSignal (auto-disable with a reason — #634)', () =
     db.prepare(`
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, enabled, source)
       VALUES ('custom', 'eol-test-custom', 'Custom EOL', 50, 50, 1, 'user')
-      ON CONFLICT(platform, model_id) DO UPDATE SET enabled = 1
+      ON CONFLICT DO UPDATE SET enabled = 1
     `).run();
     const row = db.prepare("SELECT id FROM models WHERE platform = 'custom' AND model_id = 'eol-test-custom'")
       .get() as { id: number };

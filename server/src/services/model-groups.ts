@@ -48,6 +48,7 @@ export interface GroupableRow {
   model_id: string;
   display_name: string;
   intelligence_rank?: number;
+  custom_endpoint_id?: number | null;
 }
 
 export interface ModelGroup {
@@ -130,6 +131,9 @@ export function slugifyGroupLabel(label: string): string {
 
 // ── Grouping ─────────────────────────────────────────────────────────────────
 function memberId(row: GroupableRow): string {
+  if (row.platform === 'custom' && row.custom_endpoint_id != null) {
+    return `custom:${row.custom_endpoint_id}:${row.model_id}`;
+  }
   return `${row.platform}:${row.model_id}`;
 }
 
@@ -232,7 +236,8 @@ export function resolveRequestedIdToMembers(requested: string, groups: ModelGrou
 export function getModelGroups(): ModelGroup[] {
   const db = getDb();
   const rows = db.prepare(`
-    SELECT m.id as model_db_id, m.platform, m.model_id, m.display_name, m.intelligence_rank
+    SELECT m.id as model_db_id, m.platform, m.model_id, m.display_name, m.intelligence_rank,
+           m.custom_endpoint_id
     FROM models m
   `).all() as GroupableRow[];
   return groupRows(rows, getUnifyOverrides());

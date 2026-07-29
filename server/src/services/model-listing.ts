@@ -37,7 +37,11 @@ export function buildModelListing(): ModelListing {
         SELECT 1 FROM api_keys k
         WHERE k.platform = m.platform
           AND k.enabled = 1
-          AND (m.key_id IS NULL OR k.id = m.key_id)
+          AND (
+            m.key_id IS NULL
+            OR (m.platform = 'custom' AND k.custom_endpoint_id = m.custom_endpoint_id)
+            OR (m.platform != 'custom' AND k.id = m.key_id)
+          )
       ) THEN 1 ELSE 0 END)`;
   const db = getDb();
 

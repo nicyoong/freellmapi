@@ -309,6 +309,46 @@ describe('Custom Provider Endpoints', () => {
     });
   });
 
+  describe('same model on independent custom endpoints (#651)', () => {
+    it('keeps distinct model rows, routes, and lifecycle when endpoint model ids collide', async () => {
+      const db = getDb();
+      db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom')").run();
+      db.prepare("DELETE FROM models WHERE platform = 'custom'").run();
+      db.prepare("DELETE FROM api_keys WHERE platform = 'custom'").run();
+
+      const first = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:18081/v1', model: 'shared-relay-model', label: 'Relay one',
+      });
+      const second = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:18082/v1', model: 'shared-relay-model', label: 'Relay two',
+      });
+      expect(first.status).toBe(201);
+      expect(second.status).toBe(201);
+      expect(first.body.modelDbId).not.toBe(second.body.modelDbId);
+
+      const rows = db.prepare(`
+        SELECT m.id, m.custom_endpoint_id, k.base_url
+          FROM models m JOIN api_keys k ON k.id = m.key_id
+         WHERE m.platform = 'custom' AND m.model_id = 'shared-relay-model'
+         ORDER BY k.base_url
+      `).all() as Array<{ id: number; custom_endpoint_id: number; base_url: string }>;
+      expect(rows).toHaveLength(2);
+      expect(new Set(rows.map(row => row.custom_endpoint_id)).size).toBe(2);
+
+      for (const row of rows) {
+        const route = routeRequest(1000, undefined, row.id);
+        expect((route.provider as any).baseUrl).toBe(row.base_url);
+        route.release?.();
+      }
+
+      const firstKey = db.prepare("SELECT id FROM api_keys WHERE base_url = 'http://127.0.0.1:18081/v1'").get() as { id: number };
+      expect((await del(app, `/api/keys/${firstKey.id}`)).status).toBe(200);
+      const remaining = db.prepare("SELECT m.id FROM models m JOIN api_keys k ON k.id = m.key_id WHERE m.platform = 'custom' AND m.model_id = 'shared-relay-model' AND k.base_url = 'http://127.0.0.1:18082/v1'").get();
+      expect(remaining).toBeDefined();
+      expect((db.prepare("SELECT COUNT(*) AS count FROM models WHERE platform = 'custom' AND model_id = 'shared-relay-model'").get() as { count: number }).count).toBe(1);
+    });
+  });
+
   // #281: one submit can bind several model ids to a single endpoint, instead
   // of forcing one POST per model.
   describe('multiple models per endpoint (#281)', () => {

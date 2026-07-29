@@ -7,6 +7,7 @@ import { resolveProvider } from '../providers/index.js';
 import { setCustomWeights, setRoutingStrategy } from './router.js';
 import { ensureModelInProfiles } from './profile-models.js';
 import { customModelSeed } from './custom-model-seed.js';
+import { customEndpointIdForKey, resolveCustomEndpointKey } from './custom-endpoint.js';
 import {
   clearCatalogModelTombstone,
   isCatalogManagedModel,
@@ -161,20 +162,9 @@ function upsertApiKey(db: Db, input: z.infer<typeof keySchema>): number {
 
   if (isCustom) {
     if (!baseUrl) throw new Error('baseUrl is required for custom keys');
-    const existing = db.prepare("SELECT id FROM api_keys WHERE platform = 'custom' AND base_url = ?").get(baseUrl) as { id: number } | undefined;
-    if (existing) {
-      db.prepare(`
-        UPDATE api_keys
-           SET label = ?, encrypted_key = ?, iv = ?, auth_tag = ?, enabled = ?, status = 'unknown'
-         WHERE id = ?
-      `).run(label, key.encrypted, key.iv, key.authTag, enabled, existing.id);
-      return existing.id;
-    }
-    const inserted = db.prepare(`
-      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, base_url)
-      VALUES ('custom', ?, ?, ?, ?, 'unknown', ?, ?)
-    `).run(label, key.encrypted, key.iv, key.authTag, enabled, baseUrl);
-    return Number(inserted.lastInsertRowid);
+    const resolved = resolveCustomEndpointKey(db, baseUrl, input.key?.trim() || undefined, label);
+    db.prepare('UPDATE api_keys SET enabled = ? WHERE id = ?').run(enabled, resolved.keyId);
+    return resolved.keyId;
   }
 
   const existing = db.prepare('SELECT id FROM api_keys WHERE platform = ? AND label = ? AND base_url IS NULL LIMIT 1')
@@ -226,6 +216,8 @@ function registerCustomProvider(db: Db, input: z.infer<typeof customProviderSche
     baseUrl: input.baseUrl,
     enabled: true,
   });
+  const endpointId = customEndpointIdForKey(db, keyId);
+  if (endpointId == null) throw new Error('custom endpoint identity is unavailable');
   // Same median seeding as the dashboard's custom-model path (#488): an
   // undeclared rank means "unknown", not "worst". An explicitly declared rank
   // always wins.
@@ -233,25 +225,31 @@ function registerCustomProvider(db: Db, input: z.infer<typeof customProviderSche
   let registered = 0;
   for (const entry of input.models) {
     const model = normalizeModelEntry(entry);
-    db.prepare(`
+    const existing = db.prepare(`
+      SELECT id FROM models
+       WHERE platform = 'custom' AND custom_endpoint_id = ? AND model_id = ?
+    `).get(endpointId, model.modelId) as { id: number } | undefined;
+    if (existing) {
+      db.prepare(`
+        UPDATE models SET
+          display_name = ?, intelligence_rank = ?, speed_rank = ?, size_label = ?,
+          monthly_token_budget = ?, context_window = ?, supports_vision = ?,
+          supports_tools = ?, key_id = ?, enabled = 1
+        WHERE id = ?
+      `).run(
+        model.displayName, model.intelligenceRank ?? seed.intelligenceRank,
+        model.speedRank ?? seed.speedRank, model.sizeLabel ?? seed.sizeLabel,
+        model.monthlyTokenBudget ?? '', model.contextWindow ?? null,
+        model.supportsVision ? 1 : 0, model.supportsTools ? 1 : 0, keyId, existing.id,
+      );
+    } else {
+      db.prepare(`
       INSERT INTO models
         (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
          rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-         enabled, supports_vision, supports_tools, key_id, source)
-      VALUES ('custom', ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, 1, ?, ?, ?, 'user')
-      ON CONFLICT(platform, model_id)
-      DO UPDATE SET
-        display_name = excluded.display_name,
-        intelligence_rank = excluded.intelligence_rank,
-        speed_rank = excluded.speed_rank,
-        size_label = excluded.size_label,
-        monthly_token_budget = excluded.monthly_token_budget,
-        context_window = excluded.context_window,
-        supports_vision = excluded.supports_vision,
-        supports_tools = excluded.supports_tools,
-        key_id = excluded.key_id,
-        enabled = 1
-    `).run(
+         enabled, supports_vision, supports_tools, key_id, source, custom_endpoint_id)
+      VALUES ('custom', ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, 1, ?, ?, ?, 'user', ?)
+      `).run(
       model.modelId,
       model.displayName,
       model.intelligenceRank ?? seed.intelligenceRank,
@@ -262,8 +260,11 @@ function registerCustomProvider(db: Db, input: z.infer<typeof customProviderSche
       model.supportsVision ? 1 : 0,
       model.supportsTools ? 1 : 0,
       keyId,
+      endpointId,
     );
-    const row = db.prepare("SELECT id FROM models WHERE platform = 'custom' AND model_id = ?").get(model.modelId) as { id: number };
+    }
+    const row = db.prepare("SELECT id FROM models WHERE platform = 'custom' AND custom_endpoint_id = ? AND model_id = ?")
+      .get(endpointId, model.modelId) as { id: number };
     ensureFallbackRow(db, row.id, model.fallbackEnabled !== false);
     registered++;
   }
