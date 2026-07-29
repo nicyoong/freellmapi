@@ -6,11 +6,19 @@
 
 import type { Db } from '../types.js';
 
+function hasColumn(db: Db, table: string, column: string): boolean {
+  return (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[])
+    .some(candidate => candidate.name === column);
+}
+
 export function up(db: Db): void {
-  db.exec(`
-    ALTER TABLE requests ADD COLUMN model_db_id INTEGER REFERENCES models(id);
-    CREATE INDEX idx_requests_model_db_id ON requests(model_db_id);
-  `);
+  // Deliberately no foreign key: request history must survive a user deleting
+  // the model row it once served. This also keeps cleanup paths from requiring
+  // a raw-history delete first.
+  if (!hasColumn(db, 'requests', 'model_db_id')) {
+    db.exec('ALTER TABLE requests ADD COLUMN model_db_id INTEGER;');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_requests_model_db_id ON requests(model_db_id);');
 
   // Historical catalog requests remain unambiguous. A custom request can be
   // attributed only while its key survives: the key's normalized base URL is
@@ -39,8 +47,8 @@ export function up(db: Db): void {
 }
 
 export function down(db: Db): void {
-  db.exec(`
-    DROP INDEX IF EXISTS idx_requests_model_db_id;
-    ALTER TABLE requests DROP COLUMN model_db_id;
-  `);
+  db.exec('DROP INDEX IF EXISTS idx_requests_model_db_id;');
+  if (hasColumn(db, 'requests', 'model_db_id')) {
+    db.exec('ALTER TABLE requests DROP COLUMN model_db_id;');
+  }
 }
