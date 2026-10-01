@@ -62,7 +62,7 @@ it('shows the reset-first, soon-to-run-out and unknown states without inventing 
   await mount();await openQuota()
   expect(container.textContent).toContain('Running low soon')
   expect(container.textContent).toContain('Not before reset')
-  const unknown=container.querySelector('article[aria-label="AI Horde (no key needed, slow)"]')!
+  const unknown=container.querySelector('article[aria-label="AI Horde (key optional, slow)"]')!
   expect(unknown.textContent).toContain('Unavailable')
   expect(unknown.textContent).toContain('Local usage is shown')
   expect(unknown.querySelector('[role="progressbar"]')).toBeNull()

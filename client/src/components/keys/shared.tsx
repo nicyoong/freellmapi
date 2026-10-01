@@ -57,9 +57,9 @@ export const PLATFORMS: { value: Platform; label: string; url: string; keyless?:
   { value: 'cloudflare', label: 'Cloudflare Workers AI', url: 'https://dash.cloudflare.com' },
   { value: 'zhipu', label: 'Zhipu AI (Z.ai)', url: 'https://z.ai/manage-apikey/apikey-list' },
   { value: 'ollama', label: 'Ollama Cloud', url: 'https://ollama.com/settings/keys' },
-  { value: 'kilo', label: 'Kilo Gateway (no key needed)', url: 'https://app.kilo.ai', keyless: true },
+  { value: 'kilo', label: 'Kilo Gateway (key optional)', url: 'https://app.kilo.ai', keyless: true },
   { value: 'pollinations', label: 'Pollinations', url: 'https://enter.pollinations.ai' },
-  { value: 'ovh', label: 'OVH AI Endpoints (no key needed)', url: 'https://endpoints.ai.cloud.ovh.net', keyless: true },
+  { value: 'ovh', label: 'OVH AI Endpoints (key optional)', url: 'https://endpoints.ai.cloud.ovh.net', keyless: true },
   { value: 'llm7', label: 'LLM7 (anon ok)', url: 'https://llm7.io' },
   { value: 'huggingface', label: 'HuggingFace Router', url: 'https://huggingface.co/settings/tokens' },
   { value: 'opencode', label: 'OpenCode Zen (paid models only)', url: 'https://opencode.ai/auth' },
@@ -83,7 +83,7 @@ export const PLATFORMS: { value: Platform; label: string; url: string; keyless?:
   // their free tier demonstrably works.
   { value: 'anyapi', label: 'AnyAPI (free key)', url: 'https://anyapi.ai' },
   { value: 'modelscope', label: 'ModelScope (free key, needs Aliyun cn binding)', url: 'https://modelscope.cn/my/myaccesstoken' },
-  { value: 'aihorde', label: 'AI Horde (no key needed, slow)', url: 'https://aihorde.net/register', keyless: true },
+  { value: 'aihorde', label: 'AI Horde (key optional, slow)', url: 'https://aihorde.net/register', keyless: true },
   // Chinese domestic providers. All four gate API access behind real-name
   // verification on the cloud account, so the label says so up front rather
   // than letting a user mint a key that 401s on every call (the ModelScope
