@@ -81,6 +81,15 @@ describe('editing provider credentials', () => {
     await submit()
     expect(apiFetch).toHaveBeenCalledWith('/api/keys/7', { method: 'PATCH', body: JSON.stringify({ key: 'kilo-token' }) })
   })
+  // #1360: editing the existing anonymous Kilo row is where an existing key
+  // gets pasted, so the dialog carries the same "Get API key" pointer the add
+  // form shows instead of leaving the user to find the signup page themselves.
+  it('links to the provider signup next to the key field (#1360)', () => {
+    mount(<EditKeyDialog apiKey={{ ...key, platform: 'kilo', keyless: true, keyOptional: true }} onOpenChange={onOpenChange} />)
+    const link = container.querySelector<HTMLAnchorElement>('a[href="https://app.kilo.ai"]')
+    expect(link).not.toBeNull()
+    expect(link!.textContent).toContain('Get API key')
+  })
   it('sends a normal provider token without an account prefix', async () => {
     mount(<EditKeyDialog apiKey={{ ...key, platform: 'groq' }} onOpenChange={onOpenChange} />)
     enter('#edit-key-value', ' new-token ')

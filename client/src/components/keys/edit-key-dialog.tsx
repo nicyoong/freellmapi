@@ -9,7 +9,7 @@ import { Label } from '@/components/ui/label'
 import { X } from 'lucide-react'
 import type { ApiKey } from '../../../../shared/types'
 import { useI18n } from '@/i18n'
-import { PLATFORMS } from './shared'
+import { GetKeyLink, PLATFORMS } from './shared'
 
 type UpdateBody = {
   label?: string
@@ -171,6 +171,11 @@ export function EditKeyDialog({
             <p className="text-[11px] text-muted-foreground">
               {apiKey.keyless ? t('keys.keyOptionalHint') : t('keys.editCredentialHint')}
             </p>
+            {/* Same pointer the add form shows (#137): editing an existing row
+                is where a key-optional provider's key comes from (#1360). */}
+            {provider?.url && (
+              <div className="pt-0.5"><GetKeyLink url={provider.url} /></div>
+            )}
           </div>
 
           {/* Monthly budget (#1158) stays one collapsed line; it opens by
